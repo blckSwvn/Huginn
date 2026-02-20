@@ -3,7 +3,6 @@
 ---
 
 - Main io_uring loop
-- async logging
 - http1 content-length parsing with picohttpparser 
 - Timeouts
 - keep-alive/close
