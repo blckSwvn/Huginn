@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <liburing.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <arpa/inet.h>
@@ -25,13 +26,77 @@
 enum{
 	WAKEUP = 0,
 	LISTEN = 1,
-	CLIENT = 2,
-};
-
-enum{
+	IGNORE,
 	LOG,
 	TIMER
 };
+
+#define C2B_MAX 32000
+#define B2C_MAX 16000
+struct conn{
+	struct conn *next;
+	struct conn *prev;
+	void *c2b_buf;
+	void *b2c_buf;
+	// uint64_t timestamp; //timeouts later
+	size_t c2b_used;
+	size_t c2b_off;
+	size_t b2c_used;
+	size_t b2c_off;
+	int fd;
+	int b_fd;
+	enum{
+		CLOSE = 0,
+		KEEP_ALIVE = 1,
+		CANCEL = 2,
+	}status;
+};
+
+
+enum conn_tag{//stored in the 3 lowest bits of cqe->res
+	CONNECT = 0, //000
+	C2B_READ= 1, //001
+	C2B_WRITE=2, //010
+	B2C_READ= 3, //011
+	B2C_WRITE=4, //100
+};
+#define TAG_BITS 3
+#define TAG_MASK ((1UL << TAG_BITS) -1)
+inline uint64_t tag_conn(struct conn *ptr, uint64_t tag){
+	return ((uint64_t)(uintptr_t)ptr & ~TAG_MASK) | (tag & TAG_MASK);
+}
+
+inline uint64_t get_tag(uint64_t ptr){
+	return (uintptr_t)ptr & TAG_MASK;
+}
+
+inline struct conn *untag_conn(uint64_t ptr){
+	return (struct conn *)((uintptr_t)ptr & ~TAG_MASK);
+}
+
+thread_local struct conn *used_head = NULL;
+thread_local struct conn *used_tail = NULL;
+thread_local struct conn *free_head = NULL;
+void pop_used(struct conn *c){
+	if(c->next)c->next->prev = c->prev;
+	if(c->prev)c->prev->next = c->next;
+	if(used_head == c)used_head = c->next;
+	if(used_tail == c)used_tail = c->prev;
+}
+
+void insert_used(struct conn *c){
+	c->prev = NULL;
+	c->next = used_head;
+	if(used_head)used_head->prev = c;
+	else used_tail = c;
+}
+
+void insert_free(struct conn *c){
+	c->next = free_head;
+	free_head = c;
+	//freelist is singly linked new nodes only insert to head and we only pop from head so c->prev should not be used for freelist
+}
+//pop_free is not needed as a function
 
 volatile sig_atomic_t stop = 0;
 void signal_handler(int signum){
@@ -56,7 +121,7 @@ void write_log(const char *format, ...){
 	vsnprintf(logs.buf[logs.tail].msg, sizeof(logs.buf[logs.tail].msg), format, args);
 	logs.tail++;
 	va_end(args);
-	if(logs.tail == UINT8_MAX-1){
+	if(logs.tail == 1){
 		struct io_uring_sqe *sqe = io_uring_get_sqe(&log_ring);
 		sqe->user_data = LOG;
 		io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
@@ -66,22 +131,33 @@ void write_log(const char *format, ...){
 #endif
 }
 
-static const char msg[] = "hello world!";
 _Atomic uint64_t now = 0;
 
+
 thread_local struct io_uring *ring;
+void cancel_conn(struct conn *c){
+	close(c->fd);
+	close(c->b_fd);
+	for(uint32_t i = 0; i < B2C_WRITE; i++){
+		struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+		sqe->user_data = IGNORE;
+		uint64_t user_data = tag_conn(c, i);
+		io_uring_prep_cancel(sqe, &user_data, 0);
+	}
+	io_uring_submit(ring);
+}
 #define ENTRIES 256
 void work(){
 	int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	int one = 1;
 	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	struct sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(PORT);
-	addr.sin_addr.s_addr = INADDR_ANY;
-	if(bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr))){
+	struct sockaddr_in l_addr;
+	memset(&l_addr, 0, sizeof(l_addr));
+	l_addr.sin_family = AF_INET;
+	l_addr.sin_port = htons(PORT);
+	l_addr.sin_addr.s_addr = INADDR_ANY;
+	if(bind(listen_fd, (struct sockaddr*)&l_addr, sizeof(l_addr))){
 		perror("bind");
 		return;
 	}
@@ -97,14 +173,58 @@ void work(){
 	while(1){
 		struct io_uring_cqe *cqe;
 		io_uring_wait_cqe(ring, &cqe);
+		if(!cqe){
+			write_log("%zu:cqe:NULL\n",now);
+			return;
+		}
 		if(cqe->user_data == LISTEN){
 			if(cqe->res < 0){
-				write_log("res:%s\n",strerror(-cqe->res));
+				write_log("%zu:LISTEN:res:%s\n",now,strerror(-cqe->res));
 				continue;
 			}
+			struct conn *c;
+			if(free_head){
+				c = free_head;
+				free_head = free_head->next;
+			}else{
+				c = malloc(sizeof(struct conn));
+				if(!c){
+					write_log("malloc failed\n");
+					return;
+				}
+				c->b2c_buf = malloc(B2C_MAX);
+				if(!c->b2c_buf){
+					write_log("malloc failed\n");
+					return;
+				}
+				c->c2b_buf = malloc(C2B_MAX);
+				if(!c->c2b_buf){
+					write_log("malloc failed\n");
+					return;
+				}
+			}
+			c->c2b_used = 0;
+			c->b2c_used = 0;
+			c->c2b_off = 0;
+			c->b2c_off = 0;
+			c->status = CLOSE;
+			c->fd = cqe->res;
+			insert_used(c);
+
+			c->b_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+			if(c->b_fd < 0){
+				write_log("%zu:LISTEN:b_fd:%s",now,strerror(-c->b_fd));
+				continue;
+			}
+			struct sockaddr_in addr;
+			memset(&addr, 0, sizeof(addr));
+			addr.sin_family = AF_INET;
+			addr.sin_port = htons(8080);
+			inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr.s_addr);
+
 			sqe = io_uring_get_sqe(ring);
-			sqe->user_data = CLIENT;
-			io_uring_prep_send(sqe, cqe->res, &msg, strlen(msg), 0);
+			sqe->user_data = tag_conn(c, CONNECT);
+			io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&addr, sizeof(addr));
 		}else if(cqe->user_data == WAKEUP){
 			sqe = io_uring_get_sqe(ring);
 			io_uring_prep_cancel(sqe, (uint64_t*)LISTEN, 0);
@@ -112,7 +232,87 @@ void work(){
 			sqe = io_uring_get_sqe(&log_ring);
 			io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
 			io_uring_submit(&log_ring);
+			struct conn *c = used_head;
+			while(c){
+				struct conn *next = c->next;
+				free(c->b2c_buf);
+				free(c->c2b_buf);
+				free(c);
+				c = next;
+			}
+			c = free_head;
+			while(c){
+				struct conn *next = c->next;
+				free(c->b2c_buf);
+				free(c->c2b_buf);
+				free(c);
+				c = next;
+			}
 			return;
+		}else if(cqe->user_data == IGNORE){
+			io_uring_cqe_seen(ring, cqe);
+			continue;
+		}else{
+			struct conn *c = untag_conn(cqe->user_data);
+			uint64_t tag = get_tag(cqe->user_data);
+			if(c->status == CANCEL){
+				write_log("CANCEL\n");
+				io_uring_cqe_seen(ring, cqe);
+				continue;
+			}else if(tag == CONNECT){
+				write_log("CONNECT\n");
+				if(cqe->res < 0){
+					write_log("%zu:CONNECTING:res:%s\n",strerror(-cqe->res));
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				sqe = io_uring_get_sqe(ring);
+				sqe->user_data = tag_conn(c, C2B_READ);
+				io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
+			}else if(tag == C2B_READ){
+			write_log("C2B_READ\n");
+				if(cqe->res <0){
+					write_log("%zu:C2B_READ:res:%s\n",strerror(-cqe->res));
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				c->c2b_used += cqe->res;
+				sqe = io_uring_get_sqe(ring);
+				sqe->user_data = tag_conn(c, C2B_WRITE);
+				io_uring_prep_send(sqe, c->b_fd, c->c2b_buf, c->c2b_used, 0);
+			}else if(tag == C2B_WRITE){
+			write_log("C2B_WRITE\n");
+				if(cqe->res < 0){
+					write_log("%zu:C2B_WRITE:res:%s\n",now,strerror(-cqe->res));
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				sqe = io_uring_get_sqe(ring);
+				sqe->user_data = tag_conn(c, B2C_READ);
+				io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
+			}else if(tag == B2C_READ){
+				write_log("B2C_READ\n");
+				if(cqe->res < 0){
+					write_log("%zu:B2C_READ:res:%s\n",now,strerror(-cqe->res));
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				c->b2c_used += cqe->res;
+				sqe = io_uring_get_sqe(ring);
+				sqe->user_data = tag_conn(c, B2C_WRITE);
+				io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
+			}else if(tag == B2C_WRITE){
+				write_log("B2C_WRITE\n");
+				if(cqe->res < 0){
+					write_log("%zu:B2C_WRITE:res:%s\n",now,strerror(-cqe->res));
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				if(c->status == CLOSE){
+					c->status = CANCEL;
+					cancel_conn(c);
+				}
+			}
 		}
 		io_uring_cqe_seen(ring, cqe);
 		io_uring_submit(ring);
@@ -120,6 +320,7 @@ void work(){
 }
 
 void *worker(void *arg){
+	logs.tail = 0;
 	ring = arg;
 	io_uring_queue_init(ENTRIES, ring, 0);
 	work();
@@ -146,16 +347,18 @@ int main(){
 	ts.tv_sec = TICK_NSEC / NSEC_IN_SEC;
 	ts.tv_nsec =  TICK_NSEC % NSEC_IN_SEC;
 	struct io_uring_sqe *sqe = io_uring_get_sqe(&log_ring);
+	sqe->user_data = TIMER;
 	io_uring_prep_timeout(sqe, &ts, 0, 0);
 	io_uring_submit(&log_ring);
 
 	while(!stop){
 		struct io_uring_cqe *cqe;
 		io_uring_wait_cqe(&log_ring, &cqe);
-		if(!cqe)continue;
+		if(!cqe)return 1;
 		if(cqe->user_data == TIMER){
 			struct io_uring_sqe *sqe = io_uring_get_sqe(&log_ring);
 			if(!sqe)return 1;
+			sqe->user_data = TIMER;
 			io_uring_prep_timeout(sqe, &ts, 0, 0);
 			io_uring_submit(&log_ring);
 			struct timespec tp = {0};
