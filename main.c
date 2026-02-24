@@ -40,7 +40,7 @@ struct conn{
 	struct conn *prev;
 	void *c2b_buf;
 	void *b2c_buf;
-	// uint64_t timestamp; //timeouts later
+	uint64_t timestamp;
 	size_t c2b_used;
 	size_t c2b_off;
 	size_t b2c_used;
@@ -48,9 +48,9 @@ struct conn{
 	int fd;
 	int b_fd;
 	enum{
-		CLOSE = 0,
-		KEEP_ALIVE = 1,
-		CANCEL = 2,
+		CLOSE = 1 >> 0,
+		KEEP_ALIVE = 1 >> 1,
+		CANCEL = 1 >> 2,
 	}status;
 };
 
@@ -106,7 +106,7 @@ void signal_handler(int signum){
 }
 
 typedef struct {
-	char msg[256];
+	char msg[64];
 }log_entry;
 struct log_buffer{
 	log_entry buf[UINT8_MAX];
@@ -134,7 +134,7 @@ void write_log(const char *format, ...){
 }
 
 _Atomic uint64_t now = 0;
-
+_Atomic uint64_t timeout = 0;
 
 thread_local struct io_uring *ring;
 void cancel_conn(struct conn *c){
@@ -148,6 +148,17 @@ void cancel_conn(struct conn *c){
 	}
 	io_uring_submit(ring);
 }
+
+#define NSEC_IN_SEC 1000000000ULL
+#define TIMEOUT_NSEC (10ULL * NSEC_IN_SEC) //every 10seconds
+#define TICK_NSEC    100000000ULL //every 0.1seconds
+#define SEC_TIMEOUT 10
+#define NSEC_TIMEOUT 0
+static struct __kernel_timespec ts = {
+	.tv_sec = TICK_NSEC / NSEC_IN_SEC,
+	.tv_nsec =  TICK_NSEC % NSEC_IN_SEC
+};
+
 #define ENTRIES 256
 void work(){
 	int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -171,6 +182,11 @@ void work(){
 	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
 	sqe->user_data = LISTEN;
 	io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, 0);
+
+	sqe = io_uring_get_sqe(ring);
+	sqe->user_data = TIMER;
+	io_uring_prep_timeout(sqe, &ts, 0, 0);
+
 	io_uring_submit(ring);
 	while(1){
 		struct io_uring_cqe *cqe;
@@ -251,13 +267,32 @@ void work(){
 				c = next;
 			}
 			return;
+		}else if(cqe->user_data == TIMER){
+			struct conn *c = used_tail;
+			while(c && c->timestamp < now){
+				write_log("%zu:TIMER\n",now);
+				struct conn *prev = c->prev;
+				close(c->fd);
+				close(c->b_fd);
+				for(uint32_t i = 0; i < B2C_WRITE; i++){
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = IGNORE;
+					io_uring_prep_cancel(sqe, (void*)tag_conn(c, i), 0);
+				}
+				pop_used(c);
+				insert_free(c);
+				c = prev;
+			}
+			sqe = io_uring_get_sqe(ring);
+			sqe->user_data = cqe->user_data;
+			io_uring_prep_timeout(sqe, &ts, 0, 0);
 		}else if(cqe->user_data == IGNORE){
 			io_uring_cqe_seen(ring, cqe);
 			continue;
 		}else{
 			struct conn *c = untag_conn(cqe->user_data);
 			uint64_t tag = get_tag(cqe->user_data);
-			if(c->status == CANCEL){
+			if(c->status & CANCEL){
 				write_log("CANCEL\n");
 				io_uring_cqe_seen(ring, cqe);
 				continue;
@@ -271,6 +306,7 @@ void work(){
 				sqe = io_uring_get_sqe(ring);
 				sqe->user_data = tag_conn(c, C2B_READ);
 				io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
+				c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 			}else if(tag == C2B_READ){
 			write_log("C2B_READ\n");
 				if(cqe->res <0){
@@ -279,9 +315,40 @@ void work(){
 					continue;
 				}
 				c->c2b_used += cqe->res;
-				sqe = io_uring_get_sqe(ring);
-				sqe->user_data = tag_conn(c, C2B_WRITE);
-				io_uring_prep_send(sqe, c->b_fd, c->c2b_buf, c->c2b_used, 0);
+				int minor_version;
+				const char *method, *path;
+				size_t method_len, path_len;
+				size_t num_headers = 16;
+				struct phr_header headers[num_headers];
+				int pret = phr_parse_request(c->c2b_buf, c->c2b_used,
+				 			&method, &method_len,
+				 			&path, &path_len,
+							&minor_version, headers, &num_headers, 0);
+				if(pret == -1){
+					write_log("pret==-1\n");
+					c->status |= CANCEL;
+					cancel_conn(c);
+				}else if(pret == -2){
+					write_log("pret==-2\n");
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = cqe->user_data;
+					io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX-c->c2b_used, 0);
+				}else{
+					for(uint32_t i = 0; i < num_headers; i++){
+						if(headers[i].name_len == 10 &&
+						strncasecmp(headers[i].value, "Connection", 10) == 0){
+							if(strncasecmp(headers[i].value, "Close", 5) == 0)
+								c->status |= CLOSE;
+							else
+								c->status |= KEEP_ALIVE;
+							break;
+						}
+					}
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = tag_conn(c, C2B_WRITE);
+					io_uring_prep_send(sqe, c->b_fd, c->c2b_buf, c->c2b_used, 0);
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+				}
 			}else if(tag == C2B_WRITE){
 			write_log("C2B_WRITE\n");
 				if(cqe->res < 0){
@@ -294,9 +361,11 @@ void work(){
 				if(c->c2b_off < c->c2b_used){
 					sqe->user_data = cqe->user_data;
 					io_uring_prep_send(sqe, c->fd, c->c2b_buf+c->c2b_off, c->c2b_used-c->c2b_off, 0);
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 				}else{
 					sqe->user_data = tag_conn(c, B2C_READ);
 					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 				}
 			}else if(tag == B2C_READ){
 				write_log("B2C_READ\n");
@@ -321,11 +390,12 @@ void work(){
 					sqe->user_data = cqe->user_data;
 					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
 					io_uring_cqe_seen(ring, cqe);
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 					continue;
 				}
 				else if(pret < 0){
 					write_log("pret==-1\n");
-					c->status = CANCEL;
+					c->status |= CANCEL;
 					cancel_conn(c);
 					io_uring_cqe_seen(ring, cqe);
 					continue;
@@ -349,17 +419,16 @@ void work(){
 				}
 				if(cont_len > c->b2c_used - pret){
 					c->b2c_off += cqe->res;
-					write_log("cont_len:%zd, c->b2c_used:%zu, pret:%d\n",cont_len, c->b2c_used, pret);
 					sqe = io_uring_get_sqe(ring);
 					sqe->user_data = cqe->user_data;
 					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
 				}else{
-					write_log("sucess:%zd, %zu, %d\n", cont_len, c->b2c_used, pret);
 					c->b2c_off = 0;
 					sqe = io_uring_get_sqe(ring);
 					sqe->user_data = tag_conn(c, B2C_WRITE);
 					io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
 				}
+				c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 			}else if(tag == B2C_WRITE){
 				write_log("B2C_WRITE\n");
 				if(cqe->res < 0){
@@ -372,11 +441,23 @@ void work(){
 					sqe = io_uring_get_sqe(ring);
 					sqe->user_data = cqe->user_data;
 					io_uring_prep_send(sqe, c->fd, c->b2c_buf+c->b2c_off, c->b2c_used-c->b2c_off, 0);
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 				}else{
-					c->status = CANCEL;
-					cancel_conn(c);
-					io_uring_cqe_seen(ring, cqe);
-					continue;
+					if(c->status & KEEP_ALIVE){
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = C2B_READ;
+						io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
+						c->c2b_used = 0;
+						c->c2b_off = 0;
+						c->b2c_used = 0;
+						c->c2b_off = 0;
+						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+					}else{
+						c->status |= CANCEL;
+						cancel_conn(c);
+						io_uring_cqe_seen(ring, cqe);
+						continue;
+					}
 				}
 			}
 		}
@@ -398,20 +479,13 @@ int main(){
 	signal(SIGINT, signal_handler);
 
 	io_uring_queue_init(ENTRIES, &log_ring, 0);
-
-	int n = 1;
+	int n = sysconf(_SC_NPROCESSORS_ONLN);
 	struct io_uring rings[n];
 	pthread_t tid[n];
 	for(uint32_t i = 0; i < n; i++){
 		pthread_create(&tid[i], NULL, worker, &rings[i]);
 	}
 
-#define NSEC_IN_SEC 1000000000ULL
-#define TIMEOUT_NSEC (10ULL * NSEC_IN_SEC) //every 10seconds
-#define TICK_NSEC    100000000ULL //every 0.1seconds
-	struct __kernel_timespec ts;
-	ts.tv_sec = TICK_NSEC / NSEC_IN_SEC;
-	ts.tv_nsec =  TICK_NSEC % NSEC_IN_SEC;
 	struct io_uring_sqe *sqe = io_uring_get_sqe(&log_ring);
 	sqe->user_data = TIMER;
 	io_uring_prep_timeout(sqe, &ts, 0, 0);
@@ -430,6 +504,7 @@ int main(){
 			struct timespec tp = {0};
 			clock_gettime(CLOCK_MONOTONIC, &tp);
 			atomic_store(&now, tp.tv_sec * NSEC_IN_SEC + tp.tv_nsec);
+			atomic_store(&now, (tp.tv_sec+SEC_TIMEOUT) * NSEC_IN_SEC + (tp.tv_nsec+NSEC_TIMEOUT));
 		}
 		io_uring_cqe_seen(&log_ring, cqe);
 	}

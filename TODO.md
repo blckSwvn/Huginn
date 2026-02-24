@@ -2,11 +2,10 @@
 
 ---
 
-- Timeouts
-- keep-alive/close
 - http2
-- upgradge connection
+- upgrade connection
 - chunked encoding
-- pooling of backend Fds
+- allowing for multable backends
+- pooling of backend FDs
 
 ---
