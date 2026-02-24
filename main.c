@@ -1,6 +1,8 @@
 #include "bits/time.h"
 #include "liburing/io_uring.h"
+#include "picohttpparser/picohttpparser.h"
 #include "netinet/in.h"
+#include "strings.h"
 #include "sys/socket.h"
 #include "time.h"
 #include "version.h"
@@ -104,7 +106,7 @@ void signal_handler(int signum){
 }
 
 typedef struct {
-	char msg[64];
+	char msg[256];
 }log_entry;
 struct log_buffer{
 	log_entry buf[UINT8_MAX];
@@ -287,9 +289,15 @@ void work(){
 					io_uring_cqe_seen(ring, cqe);
 					continue;
 				}
+				c->c2b_off += cqe->res;
 				sqe = io_uring_get_sqe(ring);
-				sqe->user_data = tag_conn(c, B2C_READ);
-				io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
+				if(c->c2b_off < c->c2b_used){
+					sqe->user_data = cqe->user_data;
+					io_uring_prep_send(sqe, c->fd, c->c2b_buf+c->c2b_off, c->c2b_used-c->c2b_off, 0);
+				}else{
+					sqe->user_data = tag_conn(c, B2C_READ);
+					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
+				}
 			}else if(tag == B2C_READ){
 				write_log("B2C_READ\n");
 				if(cqe->res < 0){
@@ -298,9 +306,60 @@ void work(){
 					continue;
 				}
 				c->b2c_used += cqe->res;
-				sqe = io_uring_get_sqe(ring);
-				sqe->user_data = tag_conn(c, B2C_WRITE);
-				io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
+				int minor_version, status;
+				const char *msg;
+				size_t msg_len;
+				size_t num_headers = 100;
+				struct phr_header headers[num_headers];
+				int pret = phr_parse_response(c->b2c_buf, c->b2c_used,
+							  &minor_version, &status,
+							  &msg, &msg_len, headers, &num_headers, 0);
+				if(pret == -2){
+					write_log("pret==-2\n");
+					c->b2c_off += cqe->res;
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = cqe->user_data;
+					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				else if(pret < 0){
+					write_log("pret==-1\n");
+					c->status = CANCEL;
+					cancel_conn(c);
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+
+				ssize_t cont_len = 0;
+				for(size_t i = 0; i < num_headers; i++){
+					if(headers[i].name_len == 14 &&
+					strncasecmp(headers[i].name, "Content-Length", 14) == 0){
+						const char *v = headers[i].value;
+						size_t vlen = headers[i].value_len;
+						for(size_t n = 0; n < vlen; n++){
+							if(v[n] < '0' || v[n] > '9'){//condition should never happen due to picohttpparser pret beeing == -1 if invalid header
+								write_log("failed Cont_len\n");
+								cont_len = -1;
+								break;
+							}
+							cont_len = cont_len * 10 + (v[n] - '0');
+						}
+					}
+				}
+				if(cont_len > c->b2c_used - pret){
+					c->b2c_off += cqe->res;
+					write_log("cont_len:%zd, c->b2c_used:%zu, pret:%d\n",cont_len, c->b2c_used, pret);
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = cqe->user_data;
+					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
+				}else{
+					write_log("sucess:%zd, %zu, %d\n", cont_len, c->b2c_used, pret);
+					c->b2c_off = 0;
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = tag_conn(c, B2C_WRITE);
+					io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
+				}
 			}else if(tag == B2C_WRITE){
 				write_log("B2C_WRITE\n");
 				if(cqe->res < 0){
@@ -308,9 +367,16 @@ void work(){
 					io_uring_cqe_seen(ring, cqe);
 					continue;
 				}
-				if(c->status == CLOSE){
+				c->b2c_off += cqe->res;
+				if(c->b2c_used > c->b2c_off){
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = cqe->user_data;
+					io_uring_prep_send(sqe, c->fd, c->b2c_buf+c->b2c_off, c->b2c_used-c->b2c_off, 0);
+				}else{
 					c->status = CANCEL;
 					cancel_conn(c);
+					io_uring_cqe_seen(ring, cqe);
+					continue;
 				}
 			}
 		}

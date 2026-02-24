@@ -2,7 +2,6 @@
 
 ---
 
-- http1 content-length parsing with picohttpparser 
 - Timeouts
 - keep-alive/close
 - http2

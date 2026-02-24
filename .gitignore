@@ -1,4 +1,5 @@
 *.o
+Session.vim
 Huginn
 .envrc
 .direnv/
