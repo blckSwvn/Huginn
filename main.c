@@ -47,13 +47,21 @@ struct conn{
 	size_t b2c_off;
 	int fd;
 	int b_fd;
+	int backend_index;
 	enum{
-		CLOSE = 1 >> 0,
-		KEEP_ALIVE = 1 >> 1,
-		CANCEL = 1 >> 2,
+		CLOSE = 1 << 0,
+		KEEP_ALIVE = 1 << 1,
+		CANCEL = 1 << 2,
 	}status;
 };
 
+struct backend{
+	struct sockaddr_in addr;
+	uint32_t connections;
+};
+static uint32_t backend_count = 0;
+static struct backend *global_backends = NULL;
+static thread_local struct backend *backends = NULL;
 
 enum conn_tag{//stored in the 3 lowest bits of cqe->res
 	CONNECT = 0, //000
@@ -123,7 +131,7 @@ void write_log(const char *format, ...){
 	vsnprintf(logs.buf[logs.tail].msg, sizeof(logs.buf[logs.tail].msg), format, args);
 	logs.tail++;
 	va_end(args);
-	if(logs.tail == 1){
+	if(logs.tail == 1){//for debugging 1 is fine however you might want to bump it up for more batching
 		struct io_uring_sqe *sqe = io_uring_get_sqe(&log_ring);
 		sqe->user_data = LOG;
 		io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
@@ -160,6 +168,7 @@ static struct __kernel_timespec ts = {
 };
 
 #define ENTRIES 256
+thread_local uint32_t round_robin = 0;
 void work(){
 	int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	int one = 1;
@@ -234,25 +243,36 @@ void work(){
 				write_log("%zu:LISTEN:b_fd:%s",now,strerror(-c->b_fd));
 				continue;
 			}
-			struct sockaddr_in addr;
-			memset(&addr, 0, sizeof(addr));
-			addr.sin_family = AF_INET;
-			addr.sin_port = htons(8080);
-			inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr.s_addr);
 
 			sqe = io_uring_get_sqe(ring);
 			sqe->user_data = tag_conn(c, CONNECT);
-			io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&addr, sizeof(addr));
+			if(backends[round_robin].connections < backends[(round_robin+1)%backend_count].connections){
+				io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&backends[round_robin].addr, sizeof(backends[round_robin].addr));
+				backends[round_robin].connections++;
+				c->backend_index = round_robin;
+			}
+			else{
+				io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&backends[(round_robin+1)%backend_count].addr, sizeof(backends[(round_robin+1)%backend_count].addr));
+				backends[(round_robin+1)%backend_count].connections++;
+				c->backend_index = (round_robin+1)%backend_count;
+			}
+			round_robin = (round_robin+1) % backend_count;
 		}else if(cqe->user_data == WAKEUP){
 			sqe = io_uring_get_sqe(ring);
 			io_uring_prep_cancel(sqe, (uint64_t*)LISTEN, 0);
+			close(listen_fd);
+			sqe = io_uring_get_sqe(ring);
+			io_uring_prep_cancel(sqe, (uint64_t*)TIMER, 0);
 			io_uring_submit(ring);
+
 			sqe = io_uring_get_sqe(&log_ring);
 			io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
 			io_uring_submit(&log_ring);
 			struct conn *c = used_head;
 			while(c){
 				struct conn *next = c->next;
+				close(c->fd);
+				close(c->b_fd);
 				free(c->b2c_buf);
 				free(c->c2b_buf);
 				free(c);
@@ -266,6 +286,7 @@ void work(){
 				free(c);
 				c = next;
 			}
+			free(backends);
 			return;
 		}else if(cqe->user_data == TIMER){
 			struct conn *c = used_tail;
@@ -279,6 +300,7 @@ void work(){
 					sqe->user_data = IGNORE;
 					io_uring_prep_cancel(sqe, (void*)tag_conn(c, i), 0);
 				}
+				backends[c->backend_index].connections--;
 				pop_used(c);
 				insert_free(c);
 				c = prev;
@@ -470,13 +492,41 @@ void *worker(void *arg){
 	logs.tail = 0;
 	ring = arg;
 	io_uring_queue_init(ENTRIES, ring, 0);
+	backends = malloc(sizeof(struct backend)*backend_count);
+	if(!backends){
+		write_log("malloc failed\n");
+		return NULL;
+	}
+	memcpy(backends, global_backends, sizeof(struct backend)*backend_count);
 	work();
 	return NULL;
 }
 
-int main(){
+int main(int argc, char *argv[]){
 	printf("Huginn %s\n", VERSION);
 	signal(SIGINT, signal_handler);
+
+	backend_count = (argc-1)/2;
+	global_backends = malloc(sizeof(struct backend)*backend_count);
+	if(!global_backends)return 1;
+	for(uint32_t i = 0; i < backend_count; i++){
+		char *end;
+		char *ip = argv[1+i*2];
+		char *port_str = argv[2+i*2];
+		memset(&global_backends[i].addr, 0, sizeof(global_backends[i].addr));
+		global_backends[i].addr.sin_family = AF_INET;
+		if (inet_pton(AF_INET, ip, &global_backends[i].addr.sin_addr) != 1) {
+			printf("Invalid IP: %s\n", ip);
+			return 1;
+		}
+		uint32_t port = strtol(port_str, &end, 10);
+		if (*end != '\0' || port < 1 || port > UINT16_MAX) {
+			printf("Invalid port: %s\n", port_str);
+			return 1;
+		}
+		global_backends[i].addr.sin_port = htons(port);
+		global_backends[i].connections = 0;
+	}
 
 	io_uring_queue_init(ENTRIES, &log_ring, 0);
 	int n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -504,7 +554,7 @@ int main(){
 			struct timespec tp = {0};
 			clock_gettime(CLOCK_MONOTONIC, &tp);
 			atomic_store(&now, tp.tv_sec * NSEC_IN_SEC + tp.tv_nsec);
-			atomic_store(&now, (tp.tv_sec+SEC_TIMEOUT) * NSEC_IN_SEC + (tp.tv_nsec+NSEC_TIMEOUT));
+			atomic_store(&timeout, (tp.tv_sec+SEC_TIMEOUT) * NSEC_IN_SEC + (tp.tv_nsec+NSEC_TIMEOUT));
 		}
 		io_uring_cqe_seen(&log_ring, cqe);
 	}
