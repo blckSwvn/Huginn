@@ -198,292 +198,309 @@ void work(){
 
 	io_uring_submit(ring);
 	while(1){
-		struct io_uring_cqe *cqe;
-		io_uring_wait_cqe(ring, &cqe);
-		if(!cqe){
-			write_log("%zu:cqe:NULL\n",now);
-			return;
+#define BATCH 64
+		struct io_uring_cqe *cqes[BATCH];
+		uint32_t count = io_uring_peek_batch_cqe(ring, cqes, BATCH);
+		if(count == 0){
+			io_uring_wait_cqe(ring, &cqes[0]);
+			count = 1;
 		}
-		if(cqe->user_data == LISTEN){
-			if(cqe->res < 0){
-				write_log("%zu:LISTEN:res:%s\n",now,strerror(-cqe->res));
-				continue;
+
+		for(uint32_t i = 0; i < count; i++){
+			if(!cqes[i]){
+				write_log("%zu:cqe:NULL\n",now);
+				return;
 			}
-			struct conn *c;
-			if(free_head){
+			if(cqes[i]->user_data == LISTEN){
+				if(cqes[i]->res < 0){
+					write_log("%zu:LISTEN:res:%s\n",now,strerror(-cqes[i]->res));
+					continue;
+				}
+				struct conn *c;
+				if(free_head){
+					c = free_head;
+					free_head = free_head->next;
+				}else{
+					c = malloc(sizeof(struct conn));
+					if(!c){
+						write_log("malloc failed\n");
+						return;
+					}
+					c->b2c_buf = malloc(B2C_MAX);
+					if(!c->b2c_buf){
+						write_log("malloc failed\n");
+						return;
+					}
+					c->c2b_buf = malloc(C2B_MAX);
+					if(!c->c2b_buf){
+						write_log("malloc failed\n");
+						return;
+					}
+				}
+				c->c2b_used = 0;
+				c->b2c_used = 0;
+				c->c2b_off = 0;
+				c->b2c_off = 0;
+				c->status = CLOSE;
+				c->fd = cqes[i]->res;
+				insert_used(c);
+
+				c->b_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+				if(c->b_fd < 0){
+					write_log("%zu:LISTEN:b_fd:%s",now,strerror(-c->b_fd));
+					continue;
+				}
+
+				sqe = io_uring_get_sqe(ring);
+				sqe->user_data = tag_conn(c, CONNECT);
+				if(backends[round_robin].connections < backends[(round_robin+1)%backend_count].connections){
+					io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&backends[round_robin].addr, sizeof(backends[round_robin].addr));
+					backends[round_robin].connections++;
+					c->backend_index = round_robin;
+				}
+				else{
+					io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&backends[(round_robin+1)%backend_count].addr, sizeof(backends[(round_robin+1)%backend_count].addr));
+					backends[(round_robin+1)%backend_count].connections++;
+					c->backend_index = (round_robin+1)%backend_count;
+				}
+				round_robin = (round_robin+1) % backend_count;
+				if(!(cqes[i]->flags & IORING_CQE_F_MORE)){
+					sqe = io_uring_get_sqe(ring);
+					if(!sqe){
+						write_log("%zu:could not rearm listen\n", now);
+						return;
+					}
+					sqe->user_data = LISTEN;
+					io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, 0);
+				}
+			}else if(cqes[i]->user_data == WAKEUP){
+				sqe = io_uring_get_sqe(ring);
+				io_uring_prep_cancel(sqe, (uint64_t*)LISTEN, 0);
+				close(listen_fd);
+				sqe = io_uring_get_sqe(ring);
+				io_uring_prep_cancel(sqe, (uint64_t*)TIMER, 0);
+				io_uring_submit(ring);
+
+				sqe = io_uring_get_sqe(&log_ring);
+				io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
+				io_uring_submit(&log_ring);
+				struct conn *c = used_head;
+				while(c){
+					struct conn *next = c->next;
+					close(c->fd);
+					close(c->b_fd);
+					free(c->b2c_buf);
+					free(c->c2b_buf);
+					free(c);
+					c = next;
+				}
 				c = free_head;
-				free_head = free_head->next;
-			}else{
-				c = malloc(sizeof(struct conn));
-				if(!c){
-					write_log("malloc failed\n");
-					return;
+				while(c){
+					struct conn *next = c->next;
+					free(c->b2c_buf);
+					free(c->c2b_buf);
+					free(c);
+					c = next;
 				}
-				c->b2c_buf = malloc(B2C_MAX);
-				if(!c->b2c_buf){
-					write_log("malloc failed\n");
-					return;
-				}
-				c->c2b_buf = malloc(C2B_MAX);
-				if(!c->c2b_buf){
-					write_log("malloc failed\n");
-					return;
-				}
-			}
-			c->c2b_used = 0;
-			c->b2c_used = 0;
-			c->c2b_off = 0;
-			c->b2c_off = 0;
-			c->status = CLOSE;
-			c->fd = cqe->res;
-			insert_used(c);
-
-			c->b_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-			if(c->b_fd < 0){
-				write_log("%zu:LISTEN:b_fd:%s",now,strerror(-c->b_fd));
-				continue;
-			}
-
-			sqe = io_uring_get_sqe(ring);
-			sqe->user_data = tag_conn(c, CONNECT);
-			if(backends[round_robin].connections < backends[(round_robin+1)%backend_count].connections){
-				io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&backends[round_robin].addr, sizeof(backends[round_robin].addr));
-				backends[round_robin].connections++;
-				c->backend_index = round_robin;
-			}
-			else{
-				io_uring_prep_connect(sqe, c->b_fd, (struct sockaddr*)&backends[(round_robin+1)%backend_count].addr, sizeof(backends[(round_robin+1)%backend_count].addr));
-				backends[(round_robin+1)%backend_count].connections++;
-				c->backend_index = (round_robin+1)%backend_count;
-			}
-			round_robin = (round_robin+1) % backend_count;
-		}else if(cqe->user_data == WAKEUP){
-			sqe = io_uring_get_sqe(ring);
-			io_uring_prep_cancel(sqe, (uint64_t*)LISTEN, 0);
-			close(listen_fd);
-			sqe = io_uring_get_sqe(ring);
-			io_uring_prep_cancel(sqe, (uint64_t*)TIMER, 0);
-			io_uring_submit(ring);
-
-			sqe = io_uring_get_sqe(&log_ring);
-			io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
-			io_uring_submit(&log_ring);
-			struct conn *c = used_head;
-			while(c){
-				struct conn *next = c->next;
-				close(c->fd);
-				close(c->b_fd);
-				free(c->b2c_buf);
-				free(c->c2b_buf);
-				free(c);
-				c = next;
-			}
-			c = free_head;
-			while(c){
-				struct conn *next = c->next;
-				free(c->b2c_buf);
-				free(c->c2b_buf);
-				free(c);
-				c = next;
-			}
-			free(backends);
-			return;
-		}else if(cqe->user_data == TIMER){
-			struct conn *c = used_tail;
-			while(c && c->timestamp < now){
-				write_log("%zu:TIMER\n",now);
-				struct conn *prev = c->prev;
-				close(c->fd);
-				close(c->b_fd);
-				for(uint32_t i = 0; i < B2C_WRITE; i++){
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = IGNORE;
-					io_uring_prep_cancel(sqe, (void*)tag_conn(c, i), 0);
-				}
-				backends[c->backend_index].connections--;
-				pop_used(c);
-				insert_free(c);
-				c = prev;
-			}
-			sqe = io_uring_get_sqe(ring);
-			sqe->user_data = cqe->user_data;
-			io_uring_prep_timeout(sqe, &ts, 0, 0);
-		}else if(cqe->user_data == IGNORE){
-			io_uring_cqe_seen(ring, cqe);
-			continue;
-		}else{
-			struct conn *c = untag_conn(cqe->user_data);
-			uint64_t tag = get_tag(cqe->user_data);
-			if(c->status & CANCEL){
-				write_log("CANCEL\n");
-				io_uring_cqe_seen(ring, cqe);
-				continue;
-			}else if(tag == CONNECT){
-				write_log("CONNECT\n");
-				if(cqe->res < 0){
-					write_log("%zu:CONNECTING:res:%s\n",strerror(-cqe->res));
-					io_uring_cqe_seen(ring, cqe);
-					continue;
-				}
-				sqe = io_uring_get_sqe(ring);
-				sqe->user_data = tag_conn(c, C2B_READ);
-				io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
-				c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-			}else if(tag == C2B_READ){
-			write_log("C2B_READ\n");
-				if(cqe->res <0){
-					write_log("%zu:C2B_READ:res:%s\n",strerror(-cqe->res));
-					io_uring_cqe_seen(ring, cqe);
-					continue;
-				}
-				c->c2b_used += cqe->res;
-				int minor_version;
-				const char *method, *path;
-				size_t method_len, path_len;
-				size_t num_headers = 16;
-				struct phr_header headers[num_headers];
-				int pret = phr_parse_request(c->c2b_buf, c->c2b_used,
-				 			&method, &method_len,
-				 			&path, &path_len,
-							&minor_version, headers, &num_headers, 0);
-				if(pret == -1){
-					write_log("pret==-1\n");
-					c->status |= CANCEL;
-					cancel_conn(c);
-				}else if(pret == -2){
-					write_log("pret==-2\n");
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = cqe->user_data;
-					io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX-c->c2b_used, 0);
-				}else{
-					for(uint32_t i = 0; i < num_headers; i++){
-						if(headers[i].name_len == 10 &&
-						strncasecmp(headers[i].value, "Connection", 10) == 0){
-							if(strncasecmp(headers[i].value, "Close", 5) == 0)
-								c->status |= CLOSE;
-							else
-								c->status |= KEEP_ALIVE;
-							break;
-						}
-					}
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = tag_conn(c, C2B_WRITE);
-					io_uring_prep_send(sqe, c->b_fd, c->c2b_buf, c->c2b_used, 0);
-					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-				}
-			}else if(tag == C2B_WRITE){
-			write_log("C2B_WRITE\n");
-				if(cqe->res < 0){
-					write_log("%zu:C2B_WRITE:res:%s\n",now,strerror(-cqe->res));
-					io_uring_cqe_seen(ring, cqe);
-					continue;
-				}
-				c->c2b_off += cqe->res;
-				sqe = io_uring_get_sqe(ring);
-				if(c->c2b_off < c->c2b_used){
-					sqe->user_data = cqe->user_data;
-					io_uring_prep_send(sqe, c->fd, c->c2b_buf+c->c2b_off, c->c2b_used-c->c2b_off, 0);
-					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-				}else{
-					sqe->user_data = tag_conn(c, B2C_READ);
-					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
-					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-				}
-			}else if(tag == B2C_READ){
-				write_log("B2C_READ\n");
-				if(cqe->res < 0){
-					write_log("%zu:B2C_READ:res:%s\n",now,strerror(-cqe->res));
-					io_uring_cqe_seen(ring, cqe);
-					continue;
-				}
-				c->b2c_used += cqe->res;
-				int minor_version, status;
-				const char *msg;
-				size_t msg_len;
-				size_t num_headers = 100;
-				struct phr_header headers[num_headers];
-				int pret = phr_parse_response(c->b2c_buf, c->b2c_used,
-							  &minor_version, &status,
-							  &msg, &msg_len, headers, &num_headers, 0);
-				if(pret == -2){
-					write_log("pret==-2\n");
-					c->b2c_off += cqe->res;
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = cqe->user_data;
-					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
-					io_uring_cqe_seen(ring, cqe);
-					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-					continue;
-				}
-				else if(pret < 0){
-					write_log("pret==-1\n");
-					c->status |= CANCEL;
-					cancel_conn(c);
-					io_uring_cqe_seen(ring, cqe);
-					continue;
-				}
-
-				ssize_t cont_len = 0;
-				for(size_t i = 0; i < num_headers; i++){
-					if(headers[i].name_len == 14 &&
-					strncasecmp(headers[i].name, "Content-Length", 14) == 0){
-						const char *v = headers[i].value;
-						size_t vlen = headers[i].value_len;
-						for(size_t n = 0; n < vlen; n++){
-							if(v[n] < '0' || v[n] > '9'){//condition should never happen due to picohttpparser pret beeing == -1 if invalid header
-								write_log("failed Cont_len\n");
-								cont_len = -1;
-								break;
-							}
-							cont_len = cont_len * 10 + (v[n] - '0');
-						}
-					}
-				}
-				if(cont_len > c->b2c_used - pret){
-					c->b2c_off += cqe->res;
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = cqe->user_data;
-					io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
-				}else{
-					c->b2c_off = 0;
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = tag_conn(c, B2C_WRITE);
-					io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
-				}
-				c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-			}else if(tag == B2C_WRITE){
-				write_log("B2C_WRITE\n");
-				if(cqe->res < 0){
-					write_log("%zu:B2C_WRITE:res:%s\n",now,strerror(-cqe->res));
-					io_uring_cqe_seen(ring, cqe);
-					continue;
-				}
-				c->b2c_off += cqe->res;
-				if(c->b2c_used > c->b2c_off){
-					sqe = io_uring_get_sqe(ring);
-					sqe->user_data = cqe->user_data;
-					io_uring_prep_send(sqe, c->fd, c->b2c_buf+c->b2c_off, c->b2c_used-c->b2c_off, 0);
-					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-				}else{
-					if(c->status & KEEP_ALIVE){
+				free(backends);
+				return;
+			}else if(cqes[i]->user_data == TIMER){
+				struct conn *c = used_tail;
+				while(c && c->timestamp < now){
+					write_log("%zu:TIMER\n",now);
+					struct conn *prev = c->prev;
+					close(c->fd);
+					close(c->b_fd);
+					for(uint32_t i = 0; i < B2C_WRITE; i++){
 						sqe = io_uring_get_sqe(ring);
-						sqe->user_data = C2B_READ;
-						io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
-						c->c2b_used = 0;
-						c->c2b_off = 0;
-						c->b2c_used = 0;
-						c->c2b_off = 0;
-						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
-					}else{
-						c->status |= CANCEL;
-						cancel_conn(c);
-						io_uring_cqe_seen(ring, cqe);
+						sqe->user_data = IGNORE;
+						io_uring_prep_cancel(sqe, (void*)tag_conn(c, i), 0);
+					}
+					backends[c->backend_index].connections--;
+					pop_used(c);
+					insert_free(c);
+					c = prev;
+				}
+				sqe = io_uring_get_sqe(ring);
+				sqe->user_data = cqes[i]->user_data;
+				io_uring_prep_timeout(sqe, &ts, 0, 0);
+			}else if(cqes[i]->user_data == IGNORE){
+				io_uring_cqe_seen(ring, cqes[i]);
+				continue;
+			}else{
+				struct conn *c = untag_conn(cqes[i]->user_data);
+				uint64_t tag = get_tag(cqes[i]->user_data);
+				if(c->status & CANCEL){
+					write_log("CANCEL\n");
+					io_uring_cqe_seen(ring, cqes[i]);
+					continue;
+				}else if(tag == CONNECT){
+					write_log("CONNECT\n");
+					if(cqes[i]->res < 0){
+						write_log("%zu:CONNECTING:res:%s\n",strerror(-cqes[i]->res));
+						io_uring_cqe_seen(ring, cqes[i]);
 						continue;
 					}
+					sqe = io_uring_get_sqe(ring);
+					sqe->user_data = tag_conn(c, C2B_READ);
+					io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+				}else if(tag == C2B_READ){
+					write_log("C2B_READ\n");
+					if(cqes[i]->res <0){
+						write_log("%zu:C2B_READ:res:%s\n",strerror(-cqes[i]->res));
+						io_uring_cqe_seen(ring, cqes[i]);
+						continue;
+					}
+					c->c2b_used += cqes[i]->res;
+					int minor_version;
+					const char *method, *path;
+					size_t method_len, path_len;
+					size_t num_headers = 16;
+					struct phr_header headers[num_headers];
+					int pret = phr_parse_request(c->c2b_buf, c->c2b_used,
+				  &method, &method_len,
+				  &path, &path_len,
+				  &minor_version, headers, &num_headers, 0);
+					if(pret == -1){
+						write_log("pret==-1\n");
+						c->status |= CANCEL;
+						cancel_conn(c);
+					}else if(pret == -2){
+						write_log("pret==-2\n");
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = cqes[i]->user_data;
+						io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX-c->c2b_used, 0);
+					}else{
+						for(uint32_t i = 0; i < num_headers; i++){
+							if(headers[i].name_len == 10 &&
+								strncasecmp(headers[i].name, "Connection", 10) == 0){
+								if(strncasecmp(headers[i].value, "Close", 5) == 0)
+									c->status |= CLOSE;
+								else
+									c->status |= KEEP_ALIVE;
+								break;
+							}
+						}
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = tag_conn(c, C2B_WRITE);
+						io_uring_prep_send(sqe, c->b_fd, c->c2b_buf, c->c2b_used, 0);
+						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+					}
+				}else if(tag == C2B_WRITE){
+					write_log("C2B_WRITE\n");
+					if(cqes[i]->res < 0){
+						write_log("%zu:C2B_WRITE:res:%s\n",now,strerror(-cqes[i]->res));
+						io_uring_cqe_seen(ring, cqes[i]);
+						continue;
+					}
+					c->c2b_off += cqes[i]->res;
+					sqe = io_uring_get_sqe(ring);
+					if(c->c2b_off < c->c2b_used){
+						sqe->user_data = cqes[i]->user_data;
+						io_uring_prep_send(sqe, c->fd, c->c2b_buf+c->c2b_off, c->c2b_used-c->c2b_off, 0);
+						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+					}else{
+						sqe->user_data = tag_conn(c, B2C_READ);
+						io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
+						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+					}
+				}else if(tag == B2C_READ){
+					write_log("B2C_READ\n");
+					if(cqes[i]->res < 0){
+						write_log("%zu:B2C_READ:res:%s\n",now,strerror(-cqes[i]->res));
+						io_uring_cqe_seen(ring, cqes[i]);
+						continue;
+					}
+					c->b2c_used += cqes[i]->res;
+					int minor_version, status;
+					const char *msg;
+					size_t msg_len;
+					size_t num_headers = 100;
+					struct phr_header headers[num_headers];
+					int pret = phr_parse_response(c->b2c_buf, c->b2c_used,
+				   &minor_version, &status,
+				   &msg, &msg_len, headers, &num_headers, 0);
+					if(pret == -2){
+						write_log("pret==-2\n");
+						c->b2c_off += cqes[i]->res;
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = cqes[i]->user_data;
+						io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
+						io_uring_cqe_seen(ring, cqes[i]);
+						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+						continue;
+					}
+					else if(pret < 0){
+						write_log("pret==-1\n");
+						c->status |= CANCEL;
+						cancel_conn(c);
+						io_uring_cqe_seen(ring, cqes[i]);
+						continue;
+					}
+
+					ssize_t cont_len = 0;
+					for(size_t i = 0; i < num_headers; i++){
+						if(headers[i].name_len == 14 &&
+							strncasecmp(headers[i].name, "Content-Length", 14) == 0){
+							const char *v = headers[i].value;
+							size_t vlen = headers[i].value_len;
+							for(size_t n = 0; n < vlen; n++){
+								if(v[n] < '0' || v[n] > '9'){//condition should never happen due to picohttpparser pret beeing == -1 if invalid header
+									write_log("failed Cont_len\n");
+									cont_len = -1;
+									break;
+								}
+								cont_len = cont_len * 10 + (v[n] - '0');
+							}
+						}
+					}
+					if(cont_len > c->b2c_used - pret){
+						c->b2c_off += cqes[i]->res;
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = cqes[i]->user_data;
+						io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
+					}else{
+						c->b2c_off = 0;
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = tag_conn(c, B2C_WRITE);
+						io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
+					}
+					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+				}else if(tag == B2C_WRITE){
+					write_log("B2C_WRITE\n");
+					if(cqes[i]->res < 0){
+						write_log("%zu:B2C_WRITE:res:%s\n",now,strerror(-cqes[i]->res));
+						io_uring_cqe_seen(ring, cqes[i]);
+						continue;
+					}
+					c->b2c_off += cqes[i]->res;
+					if(c->b2c_used > c->b2c_off){
+						sqe = io_uring_get_sqe(ring);
+						sqe->user_data = cqes[i]->user_data;
+						io_uring_prep_send(sqe, c->fd, c->b2c_buf+c->b2c_off, c->b2c_used-c->b2c_off, 0);
+						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+					}else{
+						if(c->status & KEEP_ALIVE){
+							sqe = io_uring_get_sqe(ring);
+							sqe->user_data = tag_conn(c, C2B_READ);
+							io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
+							c->c2b_used = 0;
+							c->c2b_off = 0;
+							c->b2c_used = 0;
+							c->c2b_off = 0;
+							c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
+						}else{
+							c->status |= CANCEL;
+							cancel_conn(c);
+							io_uring_cqe_seen(ring, cqes[i]);
+							continue;
+						}
+					}
 				}
 			}
+			io_uring_cqe_seen(ring, cqes[i]);
 		}
-		io_uring_cqe_seen(ring, cqe);
 		io_uring_submit(ring);
 	}
 }
@@ -507,6 +524,10 @@ int main(int argc, char *argv[]){
 	signal(SIGINT, signal_handler);
 
 	backend_count = (argc-1)/2;
+	if(argc < 2){
+		printf("not enough arguments!\n");
+		return 1;
+	}
 	global_backends = malloc(sizeof(struct backend)*backend_count);
 	if(!global_backends)return 1;
 	for(uint32_t i = 0; i < backend_count; i++){
@@ -562,6 +583,7 @@ int main(int argc, char *argv[]){
 	for(uint32_t i = 0; i < n; i++){
 		struct io_uring_sqe *sqe = io_uring_get_sqe(&rings[i]);
 		sqe->user_data = WAKEUP;
+		sqe->flags |= IOSQE_IO_DRAIN;
 		io_uring_prep_nop(sqe);
 		io_uring_submit(&rings[i]);
 		pthread_join(tid[i], NULL);
