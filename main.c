@@ -49,9 +49,9 @@ struct conn{
 	int b_fd;
 	int backend_index;
 	enum{
-		CLOSE = 1 << 0,
-		KEEP_ALIVE = 1 << 1,
-		CANCEL = 1 << 2,
+		CLOSE = 1 >> 0,
+		KEEP_ALIVE = 1 >> 1,
+		CANCEL = 1 >> 2,
 	}status;
 };
 

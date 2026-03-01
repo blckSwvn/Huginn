@@ -3,3 +3,4 @@ Session.vim
 Huginn
 .envrc
 .direnv/
+*.pem
