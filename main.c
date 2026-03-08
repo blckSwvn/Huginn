@@ -1,11 +1,10 @@
-#include "bits/time.h"
-#include "liburing/io_uring.h"
 #include "picohttpparser/picohttpparser.h"
-#include "netinet/in.h"
-#include "strings.h"
-#include "sys/socket.h"
-#include "time.h"
 #include "version.h"
+#include <liburing/io_uring.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <time.h>
 #include <signal.h>
 #include <stdalign.h>
 #include <stdatomic.h>
@@ -22,12 +21,11 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
-#define PORT 1234
 #define DEBUG 1
 
 enum{
-	WAKEUP = 0,
-	LISTEN = 1,
+	WAKEUP,
+	LISTEN,
 	IGNORE,
 	LOG,
 	TIMER
@@ -49,9 +47,9 @@ struct conn{
 	int b_fd;
 	int backend_index;
 	enum{
-		CLOSE = 1 >> 0,
-		KEEP_ALIVE = 1 >> 1,
-		CANCEL = 1 >> 2,
+		CLOSE = 1 << 0,
+		KEEP_ALIVE = 1 << 1,
+		CANCEL = 1 << 2,
 	}status;
 };
 
@@ -64,11 +62,11 @@ static struct backend *global_backends = NULL;
 static thread_local struct backend *backends = NULL;
 
 enum conn_tag{//stored in the 3 lowest bits of cqe->res
-	CONNECT = 0, //000
-	C2B_READ= 1, //001
-	C2B_WRITE=2, //010
-	B2C_READ= 3, //011
-	B2C_WRITE=4, //100
+	CONNECT   = 0, //000
+	C2B_READ  = 1, //001
+	C2B_WRITE = 2, //010
+	B2C_READ  = 3, //011
+	B2C_WRITE = 4, //100
 };
 #define TAG_BITS 3
 #define TAG_MASK ((1UL << TAG_BITS) -1)
@@ -97,8 +95,10 @@ void pop_used(struct conn *c){
 void insert_used(struct conn *c){
 	c->prev = NULL;
 	c->next = used_head;
-	if(used_head)used_head->prev = c;
+	if(used_head)
+		used_head->prev = c;
 	else used_tail = c;
+	used_head = c;
 }
 
 void insert_free(struct conn *c){
@@ -124,24 +124,46 @@ struct log_buffer{
 thread_local struct log_buffer logs;
 struct io_uring log_ring;
 
-void write_log(const char *format, ...){
-#ifdef DEBUG
-	va_list args;
-	va_start(args, format);
-	vsnprintf(logs.buf[logs.tail].msg, sizeof(logs.buf[logs.tail].msg), format, args);
+static void write_log(const char *msg){
+	strncpy(logs.buf[logs.tail].msg, msg, sizeof(log_entry));
 	logs.tail++;
-	va_end(args);
-	if(logs.tail == 1){//for debugging 1 is fine however you might want to bump it up for more batching
+#ifdef DEBUG
+	if(logs.tail == 1){
+	#else
+	if(logs.tail == UINT8_MAX){
+		#endif
 		struct io_uring_sqe *sqe = io_uring_get_sqe(&log_ring);
 		sqe->user_data = LOG;
 		io_uring_prep_write(sqe, STDOUT_FILENO, &logs.buf, sizeof(log_entry)*logs.tail, 0);
 		io_uring_submit(&log_ring);
 		logs.tail = 0;
-	}
-#endif
+		}
 }
 
 _Atomic uint64_t now = 0;
+
+void log_debug(const char *format, ...){
+#ifdef DEBUG
+	log_entry log;
+	va_list args;
+	va_start(args, format);
+	int len = snprintf(log.msg, sizeof(log.msg), "%zu:", now);
+	vsnprintf(log.msg + len, sizeof(log.msg) - len, format, args);
+	va_end(args);
+	write_log(log.msg);
+#endif
+}
+
+void log_fatal(const char *format, ...){
+	log_entry log;
+	va_list args;
+	va_start(args, format);
+	int len = snprintf(log.msg, sizeof(log.msg), "%zu:", now);
+	vsnprintf(log.msg + len, sizeof(log.msg) - len, format, args);
+	va_end(args);
+	write_log(log.msg);
+}
+
 _Atomic uint64_t timeout = 0;
 
 thread_local struct io_uring *ring;
@@ -151,8 +173,7 @@ void cancel_conn(struct conn *c){
 	for(uint32_t i = 0; i < B2C_WRITE; i++){
 		struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
 		sqe->user_data = IGNORE;
-		uint64_t user_data = tag_conn(c, i);
-		io_uring_prep_cancel(sqe, &user_data, 0);
+		io_uring_prep_cancel64(sqe, tag_conn(c, i), 0);
 	}
 	io_uring_submit(ring);
 }
@@ -177,14 +198,14 @@ void work(){
 	struct sockaddr_in l_addr;
 	memset(&l_addr, 0, sizeof(l_addr));
 	l_addr.sin_family = AF_INET;
-	l_addr.sin_port = htons(PORT);
+	l_addr.sin_port = htons(80);
 	l_addr.sin_addr.s_addr = INADDR_ANY;
 	if(bind(listen_fd, (struct sockaddr*)&l_addr, sizeof(l_addr))){
-		perror("bind");
+		log_fatal("bind\n");
 		return;
 	}
 	if(listen(listen_fd, SOMAXCONN)){
-		perror("listen");
+		log_fatal("listen\n");
 		return;
 	}
 
@@ -198,9 +219,8 @@ void work(){
 
 	io_uring_submit(ring);
 	while(1){
-#define BATCH 64
-		struct io_uring_cqe *cqes[BATCH];
-		uint32_t count = io_uring_peek_batch_cqe(ring, cqes, BATCH);
+		struct io_uring_cqe *cqes[ENTRIES];
+		uint32_t count = io_uring_peek_batch_cqe(ring, cqes, ENTRIES);
 		if(count == 0){
 			io_uring_wait_cqe(ring, &cqes[0]);
 			count = 1;
@@ -208,12 +228,12 @@ void work(){
 
 		for(uint32_t i = 0; i < count; i++){
 			if(!cqes[i]){
-				write_log("%zu:cqe:NULL\n",now);
+				log_debug("cqe:NULL\n");
 				return;
 			}
 			if(cqes[i]->user_data == LISTEN){
 				if(cqes[i]->res < 0){
-					write_log("%zu:LISTEN:res:%s\n",now,strerror(-cqes[i]->res));
+					log_debug("LISTEN:res:%s\n",strerror(-cqes[i]->res));
 					continue;
 				}
 				struct conn *c;
@@ -223,17 +243,17 @@ void work(){
 				}else{
 					c = malloc(sizeof(struct conn));
 					if(!c){
-						write_log("malloc failed\n");
+						log_fatal("malloc failed\n");
 						return;
 					}
 					c->b2c_buf = malloc(B2C_MAX);
 					if(!c->b2c_buf){
-						write_log("malloc failed\n");
+						log_fatal("malloc failed\n");
 						return;
 					}
 					c->c2b_buf = malloc(C2B_MAX);
 					if(!c->c2b_buf){
-						write_log("malloc failed\n");
+						log_fatal("malloc failed\n");
 						return;
 					}
 				}
@@ -247,7 +267,7 @@ void work(){
 
 				c->b_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 				if(c->b_fd < 0){
-					write_log("%zu:LISTEN:b_fd:%s",now,strerror(-c->b_fd));
+					log_debug("LISTEN:b_fd:%s",strerror(-c->b_fd));
 					continue;
 				}
 
@@ -267,7 +287,7 @@ void work(){
 				if(!(cqes[i]->flags & IORING_CQE_F_MORE)){
 					sqe = io_uring_get_sqe(ring);
 					if(!sqe){
-						write_log("%zu:could not rearm listen\n", now);
+						log_fatal("could not rearm listen\n");
 						return;
 					}
 					sqe->user_data = LISTEN;
@@ -275,10 +295,10 @@ void work(){
 				}
 			}else if(cqes[i]->user_data == WAKEUP){
 				sqe = io_uring_get_sqe(ring);
-				io_uring_prep_cancel(sqe, (uint64_t*)LISTEN, 0);
+				io_uring_prep_cancel64(sqe, LISTEN, 0);
 				close(listen_fd);
 				sqe = io_uring_get_sqe(ring);
-				io_uring_prep_cancel(sqe, (uint64_t*)TIMER, 0);
+				io_uring_prep_cancel64(sqe, TIMER, 0);
 				io_uring_submit(ring);
 
 				sqe = io_uring_get_sqe(&log_ring);
@@ -307,7 +327,7 @@ void work(){
 			}else if(cqes[i]->user_data == TIMER){
 				struct conn *c = used_tail;
 				while(c && c->timestamp < now){
-					write_log("%zu:TIMER\n",now);
+					log_debug("TIMER\n");
 					struct conn *prev = c->prev;
 					close(c->fd);
 					close(c->b_fd);
@@ -331,13 +351,13 @@ void work(){
 				struct conn *c = untag_conn(cqes[i]->user_data);
 				uint64_t tag = get_tag(cqes[i]->user_data);
 				if(c->status & CANCEL){
-					write_log("CANCEL\n");
+					log_debug("CANCEL\n");
 					io_uring_cqe_seen(ring, cqes[i]);
 					continue;
 				}else if(tag == CONNECT){
-					write_log("CONNECT\n");
+					log_debug("CONNECT\n");
 					if(cqes[i]->res < 0){
-						write_log("%zu:CONNECTING:res:%s\n",strerror(-cqes[i]->res));
+						log_debug("%zu:CONNECTING:res:%s\n",strerror(-cqes[i]->res));
 						io_uring_cqe_seen(ring, cqes[i]);
 						continue;
 					}
@@ -346,9 +366,9 @@ void work(){
 					io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
 					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 				}else if(tag == C2B_READ){
-					write_log("C2B_READ\n");
+					log_debug("C2B_READ\n");
 					if(cqes[i]->res <0){
-						write_log("%zu:C2B_READ:res:%s\n",strerror(-cqes[i]->res));
+						log_debug("%zu:C2B_READ:res:%s\n",strerror(-cqes[i]->res));
 						io_uring_cqe_seen(ring, cqes[i]);
 						continue;
 					}
@@ -363,14 +383,16 @@ void work(){
 				  &path, &path_len,
 				  &minor_version, headers, &num_headers, 0);
 					if(pret == -1){
-						write_log("pret==-1\n");
+						log_debug("C2B:pret==-1\n");
 						c->status |= CANCEL;
 						cancel_conn(c);
 					}else if(pret == -2){
-						write_log("pret==-2\n");
+						log_debug("C2B:pret==-2\n");
 						sqe = io_uring_get_sqe(ring);
 						sqe->user_data = cqes[i]->user_data;
 						io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX-c->c2b_used, 0);
+						printf("%*.s\n",(int)c->c2b_used, (char *)c->c2b_buf);
+						stop = 0;
 					}else{
 						for(uint32_t i = 0; i < num_headers; i++){
 							if(headers[i].name_len == 10 &&
@@ -388,9 +410,9 @@ void work(){
 						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 					}
 				}else if(tag == C2B_WRITE){
-					write_log("C2B_WRITE\n");
+					log_debug("C2B_WRITE\n");
 					if(cqes[i]->res < 0){
-						write_log("%zu:C2B_WRITE:res:%s\n",now,strerror(-cqes[i]->res));
+						log_debug("%zu:C2B_WRITE:res:%s\n",now,strerror(-cqes[i]->res));
 						io_uring_cqe_seen(ring, cqes[i]);
 						continue;
 					}
@@ -398,17 +420,19 @@ void work(){
 					sqe = io_uring_get_sqe(ring);
 					if(c->c2b_off < c->c2b_used){
 						sqe->user_data = cqes[i]->user_data;
-						io_uring_prep_send(sqe, c->fd, c->c2b_buf+c->c2b_off, c->c2b_used-c->c2b_off, 0);
+						io_uring_prep_send(sqe, c->b_fd, c->c2b_buf+c->c2b_off, c->c2b_used-c->c2b_off, 0);
 						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 					}else{
+						c->c2b_off = 0;
+						c->c2b_used = 0;
 						sqe->user_data = tag_conn(c, B2C_READ);
 						io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf, B2C_MAX, 0);
 						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 					}
 				}else if(tag == B2C_READ){
-					write_log("B2C_READ\n");
+					log_debug("B2C_READ\n");
 					if(cqes[i]->res < 0){
-						write_log("%zu:B2C_READ:res:%s\n",now,strerror(-cqes[i]->res));
+						log_debug("%zu:B2C_READ:res:%s\n",now,strerror(-cqes[i]->res));
 						io_uring_cqe_seen(ring, cqes[i]);
 						continue;
 					}
@@ -422,7 +446,7 @@ void work(){
 				   &minor_version, &status,
 				   &msg, &msg_len, headers, &num_headers, 0);
 					if(pret == -2){
-						write_log("pret==-2\n");
+						log_debug("B2C:pret==-2\n");
 						c->b2c_off += cqes[i]->res;
 						sqe = io_uring_get_sqe(ring);
 						sqe->user_data = cqes[i]->user_data;
@@ -432,7 +456,7 @@ void work(){
 						continue;
 					}
 					else if(pret < 0){
-						write_log("pret==-1\n");
+						log_debug("B2C:pret==-1\n");
 						c->status |= CANCEL;
 						cancel_conn(c);
 						io_uring_cqe_seen(ring, cqes[i]);
@@ -447,7 +471,7 @@ void work(){
 							size_t vlen = headers[i].value_len;
 							for(size_t n = 0; n < vlen; n++){
 								if(v[n] < '0' || v[n] > '9'){//condition should never happen due to picohttpparser pret beeing == -1 if invalid header
-									write_log("failed Cont_len\n");
+									log_debug("failed Cont_len\n");
 									cont_len = -1;
 									break;
 								}
@@ -461,16 +485,15 @@ void work(){
 						sqe->user_data = cqes[i]->user_data;
 						io_uring_prep_recv(sqe, c->b_fd, c->b2c_buf+c->b2c_off, B2C_MAX-c->b2c_off, 0);
 					}else{
-						c->b2c_off = 0;
 						sqe = io_uring_get_sqe(ring);
 						sqe->user_data = tag_conn(c, B2C_WRITE);
 						io_uring_prep_send(sqe, c->fd, c->b2c_buf, c->b2c_used, 0);
 					}
 					c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 				}else if(tag == B2C_WRITE){
-					write_log("B2C_WRITE\n");
+					log_debug("B2C_WRITE\n");
 					if(cqes[i]->res < 0){
-						write_log("%zu:B2C_WRITE:res:%s\n",now,strerror(-cqes[i]->res));
+						log_debug("%zu:B2C_WRITE:res:%s\n",now,strerror(-cqes[i]->res));
 						io_uring_cqe_seen(ring, cqes[i]);
 						continue;
 					}
@@ -482,15 +505,15 @@ void work(){
 						c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 					}else{
 						if(c->status & KEEP_ALIVE){
+							log_debug("KEEP-ALIVE\n");
 							sqe = io_uring_get_sqe(ring);
 							sqe->user_data = tag_conn(c, C2B_READ);
 							io_uring_prep_recv(sqe, c->fd, c->c2b_buf, C2B_MAX, 0);
-							c->c2b_used = 0;
-							c->c2b_off = 0;
 							c->b2c_used = 0;
-							c->c2b_off = 0;
+							c->b2c_off = 0;
 							c->timestamp = atomic_load_explicit(&timeout, memory_order_relaxed);
 						}else{
+							log_debug("CLOSE\n");
 							c->status |= CANCEL;
 							cancel_conn(c);
 							io_uring_cqe_seen(ring, cqes[i]);
@@ -511,7 +534,7 @@ void *worker(void *arg){
 	io_uring_queue_init(ENTRIES, ring, 0);
 	backends = malloc(sizeof(struct backend)*backend_count);
 	if(!backends){
-		write_log("malloc failed\n");
+		log_fatal("malloc failed\n");
 		return NULL;
 	}
 	memcpy(backends, global_backends, sizeof(struct backend)*backend_count);

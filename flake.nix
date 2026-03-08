@@ -13,6 +13,7 @@
           gdb
           curl
           netcat
+          openssl
         ];
       };
     };
